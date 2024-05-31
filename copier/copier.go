@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1339,6 +1340,14 @@ func copierHandlerGet(bulkWriter io.Writer, req request, pm *fileutils.PatternMa
 				// we don't expand any of the contents that are archives
 				options := req.GetOptions
 				options.ExpandArchives = false
+
+				type regFile struct {
+					info fs.FileInfo
+					rel  string
+					path string
+				}
+				regularFiles := []regFile{}
+
 				walkfn := func(path string, d fs.DirEntry, err error) error {
 					if err != nil {
 						if options.IgnoreUnreadable && errorIsPermission(err) {
@@ -1439,6 +1448,14 @@ func copierHandlerGet(bulkWriter io.Writer, req request, pm *fileutils.PatternMa
 							return fmt.Errorf("copier: get: error computing path of %q relative to %q: %w", path, req.Root, err)
 						}
 					}
+					if d.Type().IsRegular() {
+						regularFiles = append(regularFiles, regFile{
+							info: info,
+							rel:  rel,
+							path: path,
+						})
+						return ok
+					}
 					// add the item to the outgoing tar stream
 					if err := copierHandlerGetOne(info, symlinkTarget, rel, path, options, tw, hardlinkChecker, idMappings); err != nil {
 						if req.GetOptions.IgnoreUnreadable && errorIsPermission(err) {
@@ -1454,6 +1471,21 @@ func copierHandlerGet(bulkWriter io.Writer, req request, pm *fileutils.PatternMa
 				// walk the directory tree, checking/adding items individually
 				if err := filepath.WalkDir(item, walkfn); err != nil {
 					return fmt.Errorf("copier: get: %q(%q): %w", queue[i].glob, item, err)
+				}
+				sort.Slice(regularFiles, func(i, j int) bool {
+					return regularFiles[i].info.ModTime().Before(regularFiles[j].info.ModTime())
+				})
+				for _, r := range regularFiles {
+					// add the item to the outgoing tar stream
+					if err := copierHandlerGetOne(r.info, "", r.rel, r.path, options, tw, hardlinkChecker, idMappings); err != nil {
+						if req.GetOptions.IgnoreUnreadable && errorIsPermission(err) {
+							continue
+						} else if errors.Is(err, os.ErrNotExist) {
+							logrus.Warningf("copier: file disappeared while reading: %q", r.path)
+							continue
+						}
+						return err
+					}
 				}
 				itemsCopied++
 			} else {
