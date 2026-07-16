@@ -273,53 +273,58 @@ func (i *containerImageRef) extractConfidentialWorkloadFS(options ConfidentialWo
 // The ExtractRootfsOptions control whether or not to preserve setuid and
 // setgid bits and extended attributes on contents.
 func (i *containerImageRef) extractRootfs(opts ExtractRootfsOptions) (io.ReadCloser, chan error, error) {
-	var uidMap, gidMap []idtools.IDMap
 	mountPoint, err := i.store.Mount(i.containerID, i.mountLabel)
 	if err != nil {
 		return nil, nil, fmt.Errorf("mounting container %q: %w", i.containerID, err)
 	}
-	pipeReader, pipeWriter := io.Pipe()
+
+	var idMappings *idtools.IDMappings
+	if i.idMappingOptions != nil {
+		uidMap, gidMap := convertRuntimeIDMaps(i.idMappingOptions.UIDMap, i.idMappingOptions.GIDMap)
+		idMappings = idtools.NewIDMappingsFromMaps(uidMap, gidMap)
+	}
+
+	filter := func(path string, hdr *tar.Header) bool {
+		if idMappings != nil && !idMappings.Empty() {
+			pair := idtools.IDPair{UID: hdr.Uid, GID: hdr.Gid}
+			uid, gid, err := idMappings.ToContainer(pair)
+			if err == nil {
+				hdr.Uid = uid
+				hdr.Gid = gid
+			}
+		}
+		if opts.StripSetuidBit {
+			hdr.Mode &^= 04000
+		}
+		if opts.StripSetgidBit {
+			hdr.Mode &^= 02000
+		}
+		if opts.StripXattrs {
+			for k := range hdr.PAXRecords {
+				if strings.HasPrefix(k, archive.PaxSchilyXattr) {
+					delete(hdr.PAXRecords, k)
+				}
+			}
+		}
+		if opts.ForceTimestamp != nil {
+			hdr.ModTime = *opts.ForceTimestamp
+			hdr.AccessTime = *opts.ForceTimestamp
+			hdr.ChangeTime = *opts.ForceTimestamp
+		}
+		return true
+	}
+
+	reader, writer := io.Pipe()
 	errChan := make(chan error, 1)
+
 	go func() {
-		defer pipeWriter.Close()
+		defer writer.Close()
 		defer close(errChan)
-		if len(i.extraImageContent) > 0 {
-			// Abuse the tar format and _prepend_ the synthesized
-			// data items to the archive we'll get from
-			// copier.Get(), in a way that looks right to a reader
-			// as long as we DON'T Close() the tar Writer.
-			filename, _, _, err := i.makeExtraImageContentDiff(false, opts.ForceTimestamp)
-			if err != nil {
-				errChan <- fmt.Errorf("creating part of archive with extra content: %w", err)
-				return
-			}
-			file, err := os.Open(filename)
-			if err != nil {
-				errChan <- err
-				return
-			}
-			defer file.Close()
-			if _, err = io.Copy(pipeWriter, file); err != nil {
-				errChan <- fmt.Errorf("writing contents of %q: %w", filename, err)
-				return
-			}
-		}
-		if i.idMappingOptions != nil {
-			uidMap, gidMap = convertRuntimeIDMaps(i.idMappingOptions.UIDMap, i.idMappingOptions.GIDMap)
-		}
-		copierOptions := copier.GetOptions{
-			UIDMap:         uidMap,
-			GIDMap:         gidMap,
-			StripSetuidBit: opts.StripSetuidBit,
-			StripSetgidBit: opts.StripSetgidBit,
-			StripXattrs:    opts.StripXattrs,
-			Timestamp:      opts.ForceTimestamp,
-		}
-		err := copier.Get(mountPoint, mountPoint, copierOptions, []string{"."}, pipeWriter)
-		errChan <- err
+		errChan <- archive.CreateCanonicalTar(mountPoint, writer, filter, i.extraImageContent)
 	}()
-	return ioutils.NewReadCloserWrapper(pipeReader, func() error {
-		if err = pipeReader.Close(); err != nil {
+
+	return ioutils.NewReadCloserWrapper(reader, func() error {
+		if err = reader.Close(); err != nil {
 			err = fmt.Errorf("closing tar archive of container %q: %w", i.containerID, err)
 		}
 		if _, err2 := i.store.Unmount(i.containerID, false); err == nil {
